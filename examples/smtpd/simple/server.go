@@ -4,10 +4,9 @@ import (
 	"net"
 	"crypto/rand"
 	"encoding/base64"
-	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
+	"os"
 	"github.com/julienchan/suratan/smtpd"
 )
 
@@ -32,7 +31,7 @@ func main() {
 		go func() {
 			Accept(
 				conn.(*net.TCPConn).RemoteAddr().String(),
-				io.ReadWriteCloser(conn),
+				conn,
 			)
 
 			<-sem
@@ -40,16 +39,12 @@ func main() {
 	}
 }
 
-func Accept(remoteAddress string, conn io.ReadWriteCloser) {
+func Accept(remoteAddress string, conn net.Conn) {
 	proto := smtpd.NewProtocol(conn, &DumpHandler{})
 	proto.StartSession()
 }
 
 type DumpHandler struct {
-}
-
-func (h *DumpHandler) Logf(msg string, args ...interface{}) {
-	log.Printf(msg, args...)
 }
 
 func (h *DumpHandler) MessageReceived(msg *smtpd.SMTPMessage) (string, error) {
@@ -64,11 +59,27 @@ func (h *DumpHandler) MessageReceived(msg *smtpd.SMTPMessage) (string, error) {
 
 	rs := base64.URLEncoding.EncodeToString(rb)
 
-	b, err := ioutil.ReadAll(msg.Reader())
-	if err != nil {
+	dst := os.Stdout
+
+	if _, err := dst.Write([]byte("HELO:<" + msg.Helo + ">\r\n")); err != nil {
 		return "", nil
 	}
-	fmt.Println(string(b))
+	if _, err := dst.Write([]byte("FROM:<" + msg.From + ">\r\n")); err != nil {
+		return "", nil
+	}
+	for _, t := range msg.To {
+		if _, err := dst.Write([]byte("TO:<" + t + ">\r\n")); err != nil {
+			return "", nil
+		}
+	}
+
+	if _, err := dst.Write([]byte("\r\n")); err != nil {
+		return "", err
+	}
+
+	if _, err := io.Copy(dst, msg.Data); err != nil {
+		return "", err
+	}
 
 	return rs, nil
 }

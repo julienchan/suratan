@@ -1,14 +1,14 @@
 package smtpd
 
 import (
-	"bytes"
 	"encoding/base64"
 	"errors"
 	"io"
-	"log"
+	"net"
 	"net/textproto"
 	"regexp"
 	"strings"
+	"time"
 )
 
 type Command struct {
@@ -20,22 +20,8 @@ type Command struct {
 type SMTPMessage struct {
 	From string
 	To   []string
-	Data string
+	Data io.Reader
 	Helo string
-}
-
-func (m *SMTPMessage) Reader() io.Reader {
-	var b = new(bytes.Buffer)
-
-	b.WriteString("HELO:<" + m.Helo + ">\r\n")
-	b.WriteString("FROM:<" + m.From + ">\r\n")
-	for _, t := range m.To {
-		b.WriteString("TO:<" + t + ">\r\n")
-	}
-	b.WriteString("\r\n")
-	b.WriteString(m.Data)
-
-	return b
 }
 
 func ParseCommand(line string) *Command {
@@ -51,7 +37,6 @@ func ParseCommand(line string) *Command {
 }
 
 type ProtocolHandler interface {
-	Logf(msg string, args ...interface{})
 	MessageReceived(*SMTPMessage) (string, error)
 	ValidateSender(from string) bool
 	ValidateRecipient(to string) bool
@@ -63,7 +48,8 @@ type ProtocolHandler interface {
 
 type Protocol struct {
 	lastCommand *Command
-	Text *textproto.Conn
+	conn      	net.Conn
+	text 		*textproto.Conn
 
 	TLSPending  bool
 	TLSUpgraded bool
@@ -76,6 +62,8 @@ type Protocol struct {
 
 	MaximumLineLength int
 	MaximumRecipients int
+	MaxIdleSeconds    int
+	MaxMessageBytes   int64
 
 	handler ProtocolHandler
 
@@ -84,62 +72,60 @@ type Protocol struct {
 	RequireTLS bool
 }
 
-func NewProtocol(conn io.ReadWriteCloser, handler ProtocolHandler) *Protocol {
+func NewProtocol(conn net.Conn, handler ProtocolHandler) *Protocol {
 	p := &Protocol{
 		Hostname:          "suratan.example",
 		Ident:             "ESMTP Suratan",
 		State:             INVALID,
 		MaximumLineLength: -1,
 		MaximumRecipients: -1,
+		MaxIdleSeconds: -1,
 		handler: handler,
-		Text: textproto.NewConn(conn),
+		text: textproto.NewConn(conn),
+		conn: conn,
 	}
 	p.resetState()
 	return p
 }
 
 func (p *Protocol) Close() error {
-	return p.Text.Close()
+	return p.text.Close()
 }
 
 func (p *Protocol) resetState() {
 	p.Message = &SMTPMessage{}
 }
 
-func (p *Protocol) logf(msg string, args ...interface{}) {
-	msg = strings.Join([]string{"[PROTO: %s]", msg}, " ")
-	args = append([]interface{}{StateMap[p.State]}, args...)
-
-	if p.handler != nil {
-		p.handler.Logf(msg, args...)
-	} else {
-		log.Printf(msg, args...)
-	}
-}
-
 func (p *Protocol) StartSession() {
 	p.Start()
 	defer p.Close()
 	for {
-		id, line, err := p.NextLine()
-		if err != nil {
-			return
-		}
 		if p.State == DATA {
-			p.reply(id, p.processData(line))
+			id, reply := p.processData()
+			p.reply(id, reply)
 		} else {
+			id, line, err := p.ReadLine()
+			if err != nil {
+				return
+			}
 			p.reply(id, p.Command(ParseCommand(line)))
 		}
 	}
 }
 
-func (p *Protocol) Start() error {
-	defer p.Text.W.Flush()
+func (p *Protocol) newDataReader() io.Reader {
+	if p.MaxMessageBytes > 0 {
+		return io.LimitReader(p.text.DotReader(), p.MaxMessageBytes)
+	}
+	return p.text.DotReader()
+}
 
-	p.logf("Started session, switching to ESTABLISH state")
+func (p *Protocol) Start() error {
+	defer p.text.W.Flush()
+
 	p.State = ESTABLISH
 	r := SingleReply(220, p.Hostname + " " + p.Ident)
-	_, err := r.WriteTo(p.Text.W)
+	_, err := r.WriteTo(p.text.W)
 	return err
 }
 
@@ -156,24 +142,20 @@ func (p *Protocol) Command(cmd *Command) *Reply {
 	switch {
 	case p.TLSPending && !p.TLSUpgraded:
 		return SingleReply(221, "Bye")
-	
+
 	case cmd.cmd == "RSET":
-		p.logf("Got RSET command, switching to MAIL state")
 		p.State = MAIL
 		p.Message = &SMTPMessage{}
 		return SingleReply(250, "Ok")
 
 	case cmd.cmd == "NOOP":
-		p.logf("Got NOOP command")
 		return SingleReply(250, "Ok")
 
 	case cmd.cmd == "QUIT":
-		p.logf("Got QUIT verb, staying in %s state", StateMap[p.State])
 		p.State = DONE
 		return SingleReply(221, "Bye")
-	
+
 	case p.State == ESTABLISH:
-		p.logf("In ESTABLISH state")
 		switch cmd.cmd {
 		case "HELO":
 			return p.Helo(cmd.args)
@@ -183,21 +165,18 @@ func (p *Protocol) Command(cmd *Command) *Reply {
 
 		case "STARTTLS":
 			return p.StartTLS(cmd.args)
-		
+
 		default:
 			return SingleReply(500, "Unrecognised command")
 		}
 
 	case cmd.cmd == "STARTTLS":
-		p.logf("Got STARTTLS command outside ESTABLISH state")
 		return p.StartTLS(cmd.args)
 
 	case p.RequireTLS && !p.TLSUpgraded:
-		p.logf("RequireTLS set and not TLS not upgraded")
 		return SingleReply(530, "Must issue a STARTTLS command first")
 
 	case p.State == AUTHPLAIN:
-		p.logf("Got PLAIN authentication response: '%s', switching to MAIL state", cmd.args)
 		p.State = MAIL
 		// TODO error handling
 		val, _ := base64.StdEncoding.DecodeString(cmd.orig)
@@ -214,31 +193,25 @@ func (p *Protocol) Command(cmd *Command) *Reply {
 		}
 		return SingleReply(235, "Authentication successful")
 	case AUTHLOGIN == p.State:
-		p.logf("Got LOGIN authentication response: '%s', switching to AUTHLOGIN2 state", cmd.args)
 		p.State = AUTHLOGIN2
 		return SingleReply(334, "UGFzc3dvcmQ6")
 	case AUTHLOGIN2 == p.State:
-		p.logf("Got LOGIN authentication response: '%s', switching to MAIL state", cmd.args)
 		p.State = MAIL
 		if reply, ok := p.handler.Authenticate("LOGIN", p.lastCommand.orig, cmd.orig); !ok {
 			return reply
 		}
 		return SingleReply(235, "Authentication successful")
 	case AUTHCRAMMD5 == p.State:
-		p.logf("Got CRAM-MD5 authentication response: '%s', switching to MAIL state", cmd.args)
 		p.State = MAIL
 		if reply, ok := p.handler.Authenticate("CRAM-MD5", cmd.orig); !ok {
 			return reply
 		}
 		return SingleReply(235, "Authentication successful")
 	case MAIL == p.State:
-		p.logf("In MAIL state")
 		switch cmd.cmd {
 		case "AUTH":
-			p.logf("Got AUTH command, staying in MAIL state")
 			switch {
 			case strings.HasPrefix(cmd.args, "PLAIN "):
-				p.logf("Got PLAIN authentication: %s", strings.TrimPrefix(cmd.args, "PLAIN "))
 				val, _ := base64.StdEncoding.DecodeString(strings.TrimPrefix(cmd.args, "PLAIN "))
 				bits := strings.Split(string(val), string(rune(0)))
 
@@ -253,19 +226,15 @@ func (p *Protocol) Command(cmd *Command) *Reply {
 				}
 				return SingleReply(235, "Authentication successful")
 			case "LOGIN" == cmd.args:
-				p.logf("Got LOGIN authentication, switching to AUTH state")
 				p.State = AUTHLOGIN
 				return SingleReply(334, "VXNlcm5hbWU6")
 			case "PLAIN" == cmd.args:
-				p.logf("Got PLAIN authentication (no args), switching to AUTH2 state")
 				p.State = AUTHPLAIN
 				return SingleReply(334, "")
 			case "CRAM-MD5" == cmd.args:
-				p.logf("Got CRAM-MD5 authentication, switching to AUTH state")
 				p.State = AUTHCRAMMD5
 				return SingleReply(334, "PDQxOTI5NDIzNDEuMTI4Mjg0NzJAc291cmNlZm91ci5hbmRyZXcuY211LmVkdT4=")
 			case strings.HasPrefix(cmd.args, "EXTERNAL "):
-				p.logf("Got EXTERNAL authentication: %s", strings.TrimPrefix(cmd.args, "EXTERNAL "))
 				if reply, ok := p.handler.Authenticate("EXTERNAL", strings.TrimPrefix(cmd.args, "EXTERNAL ")); !ok {
 					return reply
 				}
@@ -274,7 +243,6 @@ func (p *Protocol) Command(cmd *Command) *Reply {
 				return SingleReply(504, "Unsupported authentication mechanism")
 			}
 		case "MAIL":
-			p.logf("Got MAIL command, switching to RCPT state")
 			from, err := p.ParseMAIL(cmd.args)
 			if err != nil {
 				return SingleReply(550, err.Error())
@@ -291,14 +259,11 @@ func (p *Protocol) Command(cmd *Command) *Reply {
 		case "EHLO":
 			return p.Ehlo(cmd.args)
 		default:
-			p.logf("Got unknown command for MAIL state: '%s'", cmd)
 			return SingleReply(500, "Unrecognised command")
 		}
 	case RCPT == p.State:
-		p.logf("In RCPT state")
 		switch cmd.cmd {
 		case "RCPT":
-			p.logf("Got RCPT command")
 			if p.MaximumRecipients > -1 && len(p.Message.To) >= p.MaximumRecipients {
 				return SingleReply(552, "Too many recipients")
 			}
@@ -318,59 +283,62 @@ func (p *Protocol) Command(cmd *Command) *Reply {
 		case "EHLO":
 			return p.Ehlo(cmd.args)
 		case "DATA":
-			p.logf("Got DATA command, switching to DATA state")
 			p.State = DATA
 			return SingleReply(354, "End data with <CR><LF>.<CR><LF>")
 		default:
-			p.logf("Got unknown command for RCPT state: '%s'", cmd)
 			return SingleReply(500, "Unrecognised command")
 		}
 	default:
-		p.logf("Got unknown command for RCPT state: '%s'", cmd)
 		return SingleReply(500, "Unrecognised command")
 	}
 }
 
-func (p *Protocol) processData(line string) *Reply {
-	p.Message.Data = line
+func (p *Protocol) processData() (uint, *Reply) {
+	p.Message.Data = p.newDataReader()
 	p.State = MAIL
 
-	defer p.resetState()
+	pid := p.text.Next()
+	p.text.StartRequest(pid)
+
+	defer func() {
+		p.resetState()
+		p.text.EndRequest(pid)
+	}()
 
 	id, err := p.handler.MessageReceived(p.Message)
 	if err != nil {
-		return SingleReply(452, "Unable to store message")
+		return 0, SingleReply(452, "Unable to store message")
 	}
-	return SingleReply(250, "Ok: queued as " + id)
+	return pid, SingleReply(250, "Ok: queued as " + id)
 }
 
 func (p *Protocol) reply(id uint, r *Reply) error {
-	p.Text.StartResponse(id)
-	defer func() {
-		if r.Done != nil {
-			r.Done()
-		}
-		p.Text.EndResponse(id)
-	}()
-	
-	_, err := r.WriteTo(p.Text.W)
+	p.conn.SetWriteDeadline(p.nextDeadline())
+
+	p.text.StartResponse(id)
+	defer p.text.EndResponse(id)
+
+	_, err := r.WriteTo(p.text.W)
 
 	if err != nil {
-		p.logf("error received: %v", err)
 		return err
 	}
-	return p.Text.W.Flush()
+	err = p.text.W.Flush()
+
+	if r.Done != nil {
+		r.Done()
+	}
+
+	return err
 }
 
 func (p *Protocol) Helo(args string) *Reply {
-	p.logf("Got HELO command, switching to MAIL state")
 	p.State = MAIL
 	p.Message.Helo = args
 	return SingleReply(250, "Hello " + args)
 }
 
 func (p *Protocol) Ehlo(args string) *Reply {
-	p.logf("Got EHLO command, switching to MAIL state")
 	p.State = MAIL
 	p.Message.Helo = args
 	replyArgs := []string{"Hello " + args, "PIPELINING"}
@@ -411,27 +379,32 @@ func (p *Protocol) StartTLS(args string) *Reply {
 	p.TLSPending = true
 
 	return &Reply{220, []string{"Ready to start TLS"}, callback}
-} 
+}
 
-func (p *Protocol) NextLine() (uint, string, error) {
-	id := p.Text.Next()
-	p.Text.StartRequest(id)
-	defer p.Text.EndRequest(id)
-	if p.State == DATA {
-		lines, err := p.Text.ReadDotLines()
-		if err != nil {
-			return 0, "", err
-		}
-		received := strings.Join(lines, "\n")
-		return id, received, nil
-	} else {
-		// command read line
-		line, err := p.Text.ReadLine()
-		if err != nil {
-			return 0, "", err
-		}
-		return id, line, nil
+func (p *Protocol) nextDeadline() time.Time {
+	if p.MaxIdleSeconds > 0 {
+		return time.Now().Add(time.Duration(p.MaxIdleSeconds) * time.Second)
 	}
+
+	return time.Time{}
+}
+
+func (p *Protocol) ReadLine() (uint, string, error) {
+	if err := p.conn.SetReadDeadline(p.nextDeadline()); err != nil {
+		return 0, "", err
+	}
+
+	id := p.text.Next()
+	p.text.StartRequest(id)
+
+	defer p.text.EndRequest(id)
+
+	line, err := p.text.ReadLine()
+	if err != nil {
+		return 0, "", err
+	}
+
+	return id, line, nil
 }
 
 var parseMailBrokenRegexp = regexp.MustCompile("(?i:From):\\s*<([^>]+)>")
